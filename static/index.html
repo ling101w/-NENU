@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>选课助手</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft Yahei", Arial, sans-serif; margin: 0; padding: 24px; }
+    .container { max-width: 1000px; margin: 0 auto; }
+    h1 { margin: 0 0 16px; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input[type="text"], textarea, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+    button { background: #1677ff; color: #fff; border: 0; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .muted { color: #888; font-size: 12px; }
+    .list { margin-top: 8px; }
+    .course { border: 1px solid #eee; border-radius: 8px; padding: 10px; margin: 8px 0; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .badge { display: inline-block; border-radius: 999px; padding: 2px 8px; font-size: 12px; background: #f0f0f0; }
+    .ok { background: #e6fffb; color: #006d75; }
+    .warn { background: #fff7e6; color: #ad6800; }
+    .error { background: #fff1f0; color: #a8071a; }
+    .success { background: #f6ffed; color: #237804; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .hidden { display: none; }
+    .hz-row { border: 1px solid #f0f0f0; border-radius: 8px; padding: 10px; margin: 8px 0; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+    .hz-main { display: grid; grid-template-columns: 140px 1fr 1fr 120px; gap: 10px; align-items: center; }
+    .hz-head { font-weight: 600; }
+    @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } .hz-main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>选课助手</h1>
+    <div class="card">
+      <div class="row">
+        <label style="min-width: 80px">Cookie</label>
+      <input id="cookie" type="text" placeholder="粘贴你的 JSESSIONID=...; iPlanetDirectoryPro=..." />
+        <button id="btnConfig">获取配置</button>
+      </div>
+      <div id="configBox" class="muted" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card hidden" id="searchCard">
+      <div class="grid2">
+        <div>
+          <label>关键词（课程名）</label>
+          <input id="kw" type="text" placeholder="例如：人工智能导论" />
+        </div>
+        <div>
+          <label>选课类型</label>
+          <select id="xklx">
+            <option value="07" selected>专业净月</option>
+            <option value="08">公共净月</option>
+            <option value="06">公共本部</option>
+            <option value="02">专业本部</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnSearch">搜索</button>
+      </div>
+      <div id="result" class="list"></div>
+    </div>
+
+    <div class="card" id="monitorCard">
+      <h3 style="margin:4px 0 12px">监控列表</h3>
+      <div id="monitorList" class="list"></div>
+      <div class="muted">提示：添加到监控后每 5 秒检查一次；抢到后自动停止并保留记录。</div>
+    </div>
+
+     <div class="card">
+       <div class="muted">提示：点击“查看详情”将基于汇总项的 kcptdm 拉取可选明细；在详情中点击“监控抢课”将进入自动监控，直到有余量或超出可选时间窗。</div>
+     </div>
+   </div>
+
+   <script>
+     const $ = (sel) => document.querySelector(sel);
+     const configBox = $('#configBox');
+     const searchCard = $('#searchCard');
+     const monitorList = $('#monitorList');
+     let globalConfig = null;
+     const monitors = new Map(); // key -> { course, status, attempts, startedAt, timer, el }
+     let lastHzkcRows = null; // 首段结果缓存，便于返回
+
+     const getXklx = () => (document.querySelector('#xklx')?.value || '07');
+
+     function fmtTimeRange(cfg){
+       if(!cfg) return '';
+       const kz = cfg.data?.xkkz || {}; // 可选课控制
+       return `阶段:${(cfg.data?.xkjdmc||[]).join('/')}, 当前阶段:${kz.xksjd||'-'} 可选时间窗: ${kz.qssj4||kz.qssj1||''} ~ ${kz.jssj4||kz.jssj1||''}`;
+     }
+
+     async function postJson(url, data){
+       const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
+       const raw = await r.text();
+       let json = null;
+       try { json = raw ? JSON.parse(raw) : null; } catch {}
+       if(!r.ok){
+         const msg = (json && (json.error || json.message)) ? (json.error || json.message) : (raw ? raw.slice(0,500) : '请求失败');
+         throw new Error(`HTTP ${r.status}: ${msg}`);
+       }
+       return json ?? (raw ? { text: raw } : {});
+     }
+
+     function inSelectableWindow(){
+       if(!globalConfig) return true; // 没拿到配置时不拦截
+       const kz = globalConfig.data?.xkkz || {};
+       const now = new Date();
+       const start = new Date((kz.qssj4 || kz.qssj1 || '').replace(' ', 'T'));
+       const end = new Date((kz.jssj4 || kz.jssj1 || '').replace(' ', 'T'));
+       if(isNaN(start.getTime()) || isNaN(end.getTime())) return true;
+       return now >= start && now <= end;
+     }
+
+     $('#btnConfig').addEventListener('click', async() => {
+       const cookie = $('#cookie').value.trim();
+       if(!cookie) return alert('请粘贴 Cookie');
+       try{
+         const data = await postJson('/api/config', { cookie, xklx: getXklx() });
+         globalConfig = data;
+         configBox.innerHTML = `<span class="badge ok">配置已加载</span> ${fmtTimeRange(data)}`;
+         searchCard.classList.remove('hidden');
+       }catch(e){
+         configBox.innerHTML = `<span class="badge error">获取配置失败</span> ${e.message}`;
+       }
+     });
+
+     // 工具方法：从对象中按多个候选键取值
+     function getVal(obj, keys){
+       for(const k of keys){ if(obj && obj[k] != null && obj[k] !== '') return obj[k]; }
+       return '';
+     }
+     // 深度查找键（用于从 hzkc 项中找 kcptdm）
+     function findDeep(obj, keyLower){
+       if(obj == null) return undefined;
+       if(Array.isArray(obj)){
+         for(const it of obj){ const v = findDeep(it, keyLower); if(v !== undefined) return v; }
+         return undefined;
+       }
+       if(typeof obj === 'object'){
+         for(const [k,v] of Object.entries(obj)){
+           if(String(k).toLowerCase() === keyLower && v != null) return v;
+           const vv = findDeep(v, keyLower); if(vv !== undefined) return vv;
+         }
+       }
+       return undefined;
+     }
+
+     function buildSearchPayload(keyword, rows, hasme='0'){
+       return {
+         kkyxdm: '', xqdm: '', nd: String(globalConfig?.data?.xkkz?.xnd || ''), zydm: '', kcdldm: '', xq: '', jc: '',
+         kcxx: keyword || '', kcfl: '', jxcdmc: '', hasme: String(hasme), teaxm: '', page: '1', rows: String(rows||60), sort: 'kcmc', order: 'asc'
+       };
+     }
+
+     function courseKey(c){
+       return String(c.kcrwdm || c.kcbh || c.kcmc || Math.random());
+     }
+
+     function createMonitorRow(entry){
+       const d = document.createElement('div');
+       d.className = 'course';
+       const left = document.createElement('div');
+       const right = document.createElement('div');
+       right.style.display='flex'; right.style.flexDirection='column'; right.style.gap='6px'; right.style.alignItems='end';
+       const c = entry.course;
+       left.innerHTML = `
+         <div><strong>${c.kcmc}</strong> <span class="badge">${c.kcdlmc||''}</span></div>
+         <div class="muted">教师：${c.teaxms||c.teaxm||''} ｜ 班级：${c.jxbmc||''}</div>
+         <div class="muted">状态：<span class="badge ${entry.status==='success'?'success':(entry.status==='stopped'?'warn':'ok')}">${entry.status}</span> ｜ 尝试：${entry.attempts}</div>
+       `;
+       const btnStop = document.createElement('button');
+       btnStop.textContent = entry.status==='running' ? '停止监控' : '已停止';
+       btnStop.disabled = entry.status!=='running';
+       btnStop.addEventListener('click', ()=> stopMonitor(entry.key));
+       const btnRemove = document.createElement('button');
+       btnRemove.textContent = '移除';
+       btnRemove.addEventListener('click', ()=> removeMonitor(entry.key));
+       right.appendChild(btnStop);
+       right.appendChild(btnRemove);
+       d.appendChild(left); d.appendChild(right);
+       return d;
+     }
+
+     function renderMonitorEntry(entry){
+       if(!entry.el){
+         entry.el = createMonitorRow(entry);
+         monitorList.appendChild(entry.el);
+       }else{
+         const newEl = createMonitorRow(entry);
+         monitorList.replaceChild(newEl, entry.el);
+         entry.el = newEl;
+       }
+     }
+
+     function stopMonitor(key){
+       const entry = monitors.get(key);
+       if(!entry) return;
+       if(entry.timer){ clearInterval(entry.timer); entry.timer = null; }
+       entry.status = 'stopped';
+       renderMonitorEntry(entry);
+     }
+
+     function removeMonitor(key){
+       const entry = monitors.get(key);
+       if(!entry) return;
+       if(entry.timer){ clearInterval(entry.timer); }
+       if(entry.el && entry.el.parentNode){ entry.el.parentNode.removeChild(entry.el); }
+       monitors.delete(key);
+     }
+
+     // 渲染二段（详情）课程列表
+     function renderCourses(rows){
+       const box = $('#result');
+       box.innerHTML = '';
+       if(lastHzkcRows && Array.isArray(lastHzkcRows)){
+         const back = document.createElement('button'); back.textContent = '返回汇总';
+         back.addEventListener('click', ()=> renderHzkc(lastHzkcRows));
+         box.appendChild(back);
+       }
+       if(!rows || !rows.length){ const d=document.createElement('div'); d.style.marginTop='8px'; d.textContent='无详情结果'; box.appendChild(d); return; }
+       for(const c of rows){
+         const item = document.createElement('div');
+         item.className = 'course';
+         const left = document.createElement('div');
+         const right = document.createElement('div');
+         right.style.display='flex'; right.style.flexDirection='column'; right.style.gap='6px'; right.style.alignItems='end';
+         left.innerHTML = `
+           <div><strong>${c.kcmc}</strong> <span class="badge">${c.kcdlmc||''}</span></div>
+           <div class="muted">教师：${c.teaxms||c.teaxm||''} ｜ 班级：${c.jxbmc||''}</div>
+           <div class="muted">时间地点：${c.xqjc||''} ｜ ${c.jxcdmc||''}</div>
+           <div class="muted">容量：${c.pkrs} 已选：${c.jxbrs} 余量：${(c.pkrs ?? 0) - (c.jxbrs ?? 0)}</div>
+         `;
+         const btnMon = document.createElement('button');
+         btnMon.textContent = '监控抢课';
+         btnMon.addEventListener('click', ()=> addMonitor(c));
+         right.appendChild(btnMon);
+         item.appendChild(left);
+         item.appendChild(right);
+         box.appendChild(item);
+       }
+     }
+
+     // 渲染首段（汇总）列表：仅展示图片里的列
+     function renderHzkc(rows){
+       lastHzkcRows = rows || [];
+       const box = $('#result');
+       box.innerHTML = '';
+       const head = document.createElement('div');
+       head.className = 'hz-row';
+       head.innerHTML = `<div class="hz-main hz-head"><div>课程编号</div><div>课程名称</div><div>开课单位</div><div>课程大类</div></div><div></div>`;
+       box.appendChild(head);
+       if(!rows || !rows.length){ const d=document.createElement('div'); d.style.marginTop='8px'; d.textContent='无结果'; box.appendChild(d); return; }
+       for(const it of rows){
+         const code = getVal(it, ['kcbh','kcrwdm','kch']);
+         const name = getVal(it, ['kcmc','kCMC']);
+         const unit = getVal(it, ['kkxymc','kkdwmc','kkyxmc','kkyx']);
+         const cat = getVal(it, ['kcdlmc','kclbmc']);
+         const row = document.createElement('div'); row.className='hz-row';
+         const left = document.createElement('div'); left.className='hz-main';
+         left.innerHTML = `<div>${code||''}</div><div><strong>${name||''}</strong></div><div>${unit||''}</div><div>${cat||''}</div>`;
+         const right = document.createElement('div');
+         const btn = document.createElement('button'); btn.textContent='查看详情';
+         btn.addEventListener('click', ()=> showDetails(it));
+         right.appendChild(btn);
+         row.appendChild(left); row.appendChild(right);
+         box.appendChild(row);
+       }
+     }
+
+     async function showDetails(hzItem){
+       const cookie = $('#cookie').value.trim();
+       if(!cookie) return alert('请先粘贴 Cookie，并点击获取配置');
+       const xklx = getXklx();
+       const kcptdm = String(getVal(hzItem,['kcptdm']) || findDeep(hzItem,'kcptdm') || '').trim();
+       if(!kcptdm){ alert('未找到该课程的 kcptdm，无法查询详情'); return; }
+       try{
+         const payload = { kcptdm, page: 1, rows: 60, sort: 'kcrwdm', order: 'asc' };
+         const data = await postJson('/api/kxkc', { cookie, payload, xklx });
+         renderCourses(data.rows || []);
+       }catch(e){
+         console.error(e);
+         alert('加载详情失败：'+e.message);
+       }
+     }
+
+     $('#btnSearch').addEventListener('click', async()=>{
+       const cookie = $('#cookie').value.trim();
+       const kw = $('#kw').value.trim();
+       try{
+         const payload = { kcxx: kw };
+         const data = await postJson('/api/hzkc', { cookie, payload, xklx: getXklx() });
+         // hzkc 返回结构可能为 { rows: [...] } 或数组，做兼容
+         const rows = Array.isArray(data) ? data : (data.rows || data.data || []);
+         renderHzkc(rows);
+       }catch(e){
+         console.error(e);
+         alert('搜索失败：'+e.message);
+       }
+     });
+
+     function courseHasSlot(c){
+       const cap = Number(c.pkrs||0);
+       const sel = Number(c.jxbrs||0);
+       return cap > sel;
+     }
+
+     async function checkAndSelect(cookie, c){
+       const payload = buildSearchPayload(c.kcmc, 60, '0');
+       const data = await postJson('/api/search', { cookie, payload, xklx: getXklx() });
+       const found = (data.rows||[]).find(x => x.kcrwdm === c.kcrwdm || x.kcbh === c.kcbh || x.jxbmc === c.jxbmc || x.kcmc === c.kcmc);
+       if(found){
+         const cap = Number(found.pkrs||0);
+         const sel = Number(found.jxbrs||0);
+         if(cap !== sel && cap > sel){
+           const addPayload = { kcrwdm: String(found.kcrwdm||c.kcrwdm||''), kcmc: found.kcmc||c.kcmc||'', qz: '-1', hlct: '0' };
+           try{
+             const addRes = await postJson('/api/add', { cookie, payload: addPayload, xklx: getXklx() });
+             return { ok: true, msg: JSON.stringify(addRes) };
+           }catch(err){
+             console.error('[ADD] error:', err);
+             return { ok:false, msg: String(err?.message || err) };
+           }
+         }
+         return { ok:false, msg:`暂无余量（${sel}/${cap}）` };
+       }
+       return { ok:false, msg:'未在搜索结果中找到对应课程' };
+     }
+
+     function addMonitor(c){
+       const cookie = $('#cookie').value.trim();
+       if(!cookie) return alert('请先粘贴 Cookie，并点击获取配置');
+       const key = courseKey(c);
+       let entry = monitors.get(key);
+       if(entry && entry.status==='running'){
+         alert('该课程已在监控中');
+         return;
+       }
+       if(!entry){
+         entry = { key, course: c, status:'running', attempts:0, startedAt: Date.now(), timer:null, el:null };
+         monitors.set(key, entry);
+       }else{
+         entry.status='running'; entry.attempts=0; entry.startedAt=Date.now();
+       }
+       renderMonitorEntry(entry);
+
+       const doCheck = async()=>{
+         if(!inSelectableWindow()){
+           if(entry.timer){ clearInterval(entry.timer); entry.timer=null; }
+           entry.status='stopped';
+           renderMonitorEntry(entry);
+           return;
+         }
+         try{
+           entry.attempts++;
+           renderMonitorEntry(entry);
+           const r = await checkAndSelect(cookie, c);
+           if(r.ok){
+             if(entry.timer){ clearInterval(entry.timer); entry.timer=null; }
+             entry.status='success';
+             renderMonitorEntry(entry);
+           }
+         }catch(err){
+           console.error('[MONITOR] attempt error:', err);
+         }
+       };
+
+       doCheck();
+       entry.timer = setInterval(doCheck, 5000);
+     }
+
+     async function startRush(c, btn){
+        const cookie = $('#cookie').value.trim();
+        if(!cookie) return alert('请先粘贴 Cookie，并点击获取配置');
+        if(!inSelectableWindow()) return alert('当前不在可选时间窗内，无法抢课');
+        btn.disabled = true; btn.textContent='查询中...';
+       try{
+         let res = await checkAndSelect(cookie, c);
+         if(res.ok){ btn.textContent = '已成功'; btn.classList.add('success'); return; }
+         btn.textContent = '监控中(5s)';
+         const timer = setInterval(async()=>{
+           if(!inSelectableWindow()) { clearInterval(timer); btn.disabled=false; btn.textContent='已过期'; btn.classList.add('warn'); return; }
+           try{
+             const r = await checkAndSelect(cookie, c);
+             if(r.ok){ clearInterval(timer); btn.textContent='已成功'; btn.classList.add('success'); }
+             else { btn.textContent = '监控中(5s)'; }
+           }catch(err){ console.error(err); btn.textContent='重试中...'; }
+         }, 5000);
+       }catch(e){
+         alert('抢课失败：'+e.message);
+         btn.disabled=false; btn.textContent='抢课';
+       }
+     }
+   </script>
+ </body>
+ </html>
